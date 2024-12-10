@@ -15,9 +15,10 @@ load_dotenv()  # Загрузка переменных из .env
 # Чтение переменных
 TOKEN = os.getenv("TOKEN")
 REMINDER_INTERVAL = int(os.getenv("REMINDER_INTERVAL"))
-REMINDER_CHAT_ID = os.getenv("REMINDER_CHAT_ID")
-STATUS_CHAT_ID = os.getenv("STATUS_CHAT_ID")
-BD_HOST = os.getenv("BD_HOST")
+REMINDER_TOPIC_ID = int(os.getenv("REMINDER_TOPIC_ID"))
+STATUS_TOPIC_ID = int(os.getenv("STATUS_TOPIC_ID"))
+BD_HOST = str(os.getenv("BD_HOST"))
+
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -91,14 +92,15 @@ async def send_reminder(ticket_number: str):
         ticket = active_tickets.get(ticket_number)
         if ticket:
             ticket["remind_times"] += 1
-            start_time = datetime.strptime(ticket["start_time"], '%H:%M %d.%m.%Y')
-            elapsed_time = datetime.now() - timedelta(hours=3) - start_time  # Разница во времени
+            start_time = datetime.strptime(ticket["start_time"], '%H:%M %d.%m.%Y').replace(tzinfo=UTC)
+            elapsed_time = datetime.now(UTC) + timedelta(hours=3) - start_time  # Разница во времени
             elapsed_minutes = elapsed_time.total_seconds() // 60  # Преобразование в минуты
 
             # Отправляем сообщение как ответ на исходное сообщение
             sent_message = await bot.send_message(
-                chat_id=REMINDER_CHAT_ID,
-                text=f"{ticket_number} прошло {int(elapsed_minutes)} мин."
+                chat_id=ticket["chat_id"],
+                text=f"{ticket_number} прошло {int(elapsed_minutes)} мин.",
+                message_thread_id=REMINDER_TOPIC_ID
             )
 
             # Сохраняем message_id отправленного сообщения
@@ -159,8 +161,9 @@ async def handle_message(message: Message):
             else:
                 # Отправляем сообщение в тему Статус
                 opens_message_id = await bot.send_message(
-                    chat_id=STATUS_CHAT_ID,
-                    text=f"{ticket_number}\n📥 открыт в {date_time_formatter(now)}"
+                    chat_id=chat_id,
+                    text=f"{ticket_number}\n📥 открыт в {date_time_formatter(now)}",
+                    message_thread_id=STATUS_TOPIC_ID
                 )
 
                 active_tickets[ticket_number] = {
@@ -197,20 +200,11 @@ async def handle_message(message: Message):
             if ticket_number in active_tickets:
                 ticket = active_tickets[ticket_number]
 
-                try:
-                    await bot.delete_message(chat_id=ticket["chat_id"], message_id=message.reply_to_message.message_id)
-                    # Удаляем сообщение с -
-                    await bot.delete_message(chat_id=ticket["chat_id"], message_id=message.message_id)
-                    logging.info(f" === APP_LOG: Message for ticket {ticket_number} deleted.")
-                except Exception as e:
-                    logging.error(f" === APP_LOG: Failed to delete message for ticket {ticket_number}: {e}")
-
                 # Отправляем сообщение о закрытии в тему Статус
                 await bot.edit_message_text(
-                    chat_id=STATUS_CHAT_ID,
+                    chat_id=chat_id,
                     message_id=ticket['opens_message_id'],
                     text=f"{ticket_number}\n📥 открыт в {date_time_formatter(ticket['start_time'])}\n✅ закрыт в {date_time_formatter(now)}",
-
                 )
 
                 remove_reminder(ticket_number)  # Удаляем задачу из планировщика
@@ -224,7 +218,7 @@ async def handle_message(message: Message):
                 # Удаляем все сообщения-оповещения
                 for msg_id in ticket.get("notification_messages", []):
                     try:
-                        await bot.delete_message(chat_id=REMINDER_CHAT_ID, message_id=msg_id)
+                        await bot.delete_message(chat_id=ticket["chat_id"], message_id=msg_id)
                         logging.info(f" === APP_LOG: Deleted notification message {msg_id} for ticket {ticket_number}")
                     except Exception as e:
                         logging.error(
@@ -232,12 +226,13 @@ async def handle_message(message: Message):
 
                 del active_tickets[ticket_number]  # Удаляем из списка активных заявок
                 save_tickets()  # Сохраняем изменения
-                try:
-                    await bot.delete_message(chat_id=ticket["chat_id"], message_id=message.reply_to_message.message_id)
-                except Exception as e:
-                    logging.error(f" === APP_LOG: Failed to delete message for ticket {ticket_number}: {e}")
-            else:
-                await message.reply(f"{ticket_number} Не найден.")
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message.reply_to_message.message_id)
+                # Удаляем сообщение с -
+                await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+                logging.info(f" === APP_LOG: Message for ticket {ticket_number} deleted.")
+            except Exception as e:
+                logging.error(f" === APP_LOG: Failed to delete message for ticket {ticket_number}: {e}")
 
         # Показать открытые заявки
         elif "list" in message.text.lower():
