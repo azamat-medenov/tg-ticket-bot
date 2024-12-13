@@ -3,11 +3,17 @@ import json
 import atexit
 import asyncio
 import logging
+import uuid
+
+import httpx
+
 import aioschedule as schedule
 from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message
 from datetime import datetime, UTC, timedelta
 from dotenv import load_dotenv
+
+from dataclasses import dataclass
 
 logging.basicConfig(level=logging.INFO)
 
@@ -18,6 +24,8 @@ REMINDER_INTERVAL = int(os.getenv("REMINDER_INTERVAL"))
 REMINDER_TOPIC_ID = int(os.getenv("REMINDER_TOPIC_ID"))
 STATUS_TOPIC_ID = int(os.getenv("STATUS_TOPIC_ID"))
 BD_HOST = str(os.getenv("BD_HOST"))
+LUCKYPAY_API_KEY = os.getenv("LUCKYPAY_API_KEY")
+LUCKYPAY_URL = os.getenv("LUCKYPAY_URL")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -26,8 +34,72 @@ active_tickets = {}
 scheduled_jobs = {}
 
 
+@dataclass
+class TicketFromAPI:
+    client_name: str
+    provider_name: str
+    amount: str
+    requisites: str
+    provider_order_id: str
+    message_id: int | None = None
+
+
+def is_uuid(string: str) -> bool:
+    try:
+        uuid.UUID(string)
+        return True
+    except ValueError:
+        return False
+
+
 def now_utc3() -> datetime:
     return datetime.now(UTC) + timedelta(hours=3)
+
+
+async def get_ticket_from_db(ticket_number: str) -> TicketFromAPI | None:
+    for ticket in ticket_number.split():
+        if is_uuid(ticket):  # наши id всегда UUID
+            try:
+                async with httpx.AsyncClient() as http_client:
+                    order_response = await http_client.get(
+                        LUCKYPAY_URL + f"/api/v1/order/{ticket}",
+                        headers={"X-API-Key": LUCKYPAY_API_KEY}
+                    )
+                    data = order_response.json()
+
+                    logging.info(f"Response received from LuckyPay {data}")
+
+                    order_response.raise_for_status()
+
+                    data = data["order"]
+
+                    provider_order_id = data["provider_order_id"]
+                    provider_id = data["provider_id"]
+                    client_id = data["client_id"]
+
+                    provider_response = await http_client.get(
+                        LUCKYPAY_URL + f"/api/v1/provider/{provider_id}",
+                        headers={"X-API-Key": LUCKYPAY_API_KEY}
+                    )
+
+                    provider_name = provider_response.json()["name"]
+
+                    client_response = await http_client.get(
+                        LUCKYPAY_URL + f"/api/v1/client/{client_id}",
+                        headers={"X-API-Key": LUCKYPAY_API_KEY}
+                    )
+                    client_name = client_response.json()["name"]
+
+                    return TicketFromAPI(
+                        provider_name=provider_name,
+                        client_name=client_name,
+                        amount=str(data["amount"]),
+                        requisites=data["holder_account"],
+                        provider_order_id=provider_order_id
+
+                    )
+            except Exception as e:
+                logging.error(f" === APP_LOG: error getting ticket in luckypay db, ticket - {ticket} {e}")
 
 
 # Загрузка заявок из файла
@@ -168,6 +240,15 @@ async def close_ticket(
 
     if ticket_number not in active_tickets:
         logging.error(f" === APP_LOG: ticket {ticket_number} not found in active tickets")
+        try:
+            # Удаляем сообщение с заявкой
+            await bot.delete_message(chat_id=chat_id, message_id=message.reply_to_message.message_id)
+            logging.info(
+                f" === APP_LOG: Message {message.reply_to_message.message_id} for ticket {ticket_number} deleted.")
+        except Exception as e:
+            logging.error(
+                f" === APP_LOG: Failed to delete message {message.reply_to_message.message_id} for ticket {ticket_number}: {e}")
+
         return
 
     ticket = active_tickets[ticket_number]
@@ -188,6 +269,11 @@ async def close_ticket(
     remove_reminder(ticket_number)  # Удаляем задачу из планировщика
     # Удаляем все сообщения-оповещения
     await remove_notifications(ticket, ticket_number)
+    # Удаляем сообщение с деталями
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=ticket["detail_message_id"])
+    except Exception as e:
+        logging.error(f" APP_LOG: Failed to delete detail message for ticket {ticket_number} {e}")
     del active_tickets[ticket_number]  # Удаляем из списка активных заявок
     save_tickets()  # Сохраняем изменения
     logging.info(f" === APP_LOG: Removed ticket {ticket_number}")
@@ -207,9 +293,11 @@ def get_ticket_from_reply(message: Message) -> str:
     if message.reply_to_message is None:
         logging.warning(f"'{message.text}' command was used without reply")
         return
+    if message.reply_to_message.caption is None:
+        logging.warning(f"replied not to photo")
+        return
 
     return " ".join(message.reply_to_message.caption.split())
-
 
 
 # --- Команды бота ---------------------------------------------------------
@@ -218,7 +306,6 @@ async def handle_message(message: Message):
     # Проверяем, что сообщение пришло из группы или супергруппы
     if message.chat.type in ["group", "supergroup"]:
         logging.info(f" === APP_LOG: Message received from the group: {message.chat.title} | {message.text}")
-
         now = now_utc3().strftime('%H:%M %d.%m.%Y')
         chat_id = message.chat.id
         topic_id = message.message_thread_id
@@ -232,6 +319,9 @@ async def handle_message(message: Message):
         if message.text == "+":
             ticket_number = get_ticket_from_reply(message)
 
+            if ticket_number is None:
+                return
+
             chat_id = message.reply_to_message.chat.id
             topic_id = message.reply_to_message.message_thread_id
 
@@ -239,6 +329,20 @@ async def handle_message(message: Message):
                 logging.warning(f"Ticket {ticket_number} already exists.")
                 await message.reply(f"Ticket {ticket_number} already exists.")
             else:
+                ticket = await get_ticket_from_db(ticket_number)
+
+                if ticket is None:
+                    logging.warning(f" === APP_LOG: no ticket got from db - {ticket_number} ")
+                else:
+                    try:
+                        ticket.message_id = (await message.reply_to_message.reply(
+                            f"Провайдер: {ticket.provider_name}\nМерчант: {ticket.client_name}\n"
+                            f"Сумма: {ticket.amount}\nРеквизиты: {ticket.requisites}\n\n"
+                            f"{ticket.provider_order_id}"
+                        )).message_id
+                    except Exception:
+                        logging.error(f" === APP_LOG: Failed to send detail message for ticket {ticket_number}")
+
                 # Отправляем сообщение в тему Статус
                 opens_message_id = await bot.send_message(
                     chat_id=chat_id,
@@ -252,6 +356,7 @@ async def handle_message(message: Message):
                     "message_thread_id": topic_id,
                     "message_id": message.message_id,
                     "opens_message_id": opens_message_id.message_id,
+                    "detail_message_id": ticket.message_id if ticket else None,
                     "remind_times": 0,
                     "notification_messages": []
                 }
@@ -339,6 +444,18 @@ async def handle_message(message: Message):
             await close_ticket(ticket_number, chat_id, message)
 
         # Показать открытые заявки
+        elif "delete" == message.text:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+                logging.info(f" === APP_LOG: Delete command deleted.")
+            except Exception as e:
+                logging.error(f" === APP_LOG: Failed to delete Delete command: {e}")
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message.reply_to_message.message_id)
+            except Exception:
+                logging.error(f" === APP_LOG: Failed to delete message: {e}")
+
+
         elif "list" == message.text.lower():
             chunk_size = 4096
             json_data = json.dumps(active_tickets, ensure_ascii=False, indent=4)
