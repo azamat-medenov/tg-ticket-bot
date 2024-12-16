@@ -4,6 +4,8 @@ import atexit
 import asyncio
 import logging
 import uuid
+from collections import defaultdict
+from json import loads
 
 import httpx
 
@@ -13,7 +15,7 @@ from aiogram.types import Message
 from datetime import datetime, UTC, timedelta
 from dotenv import load_dotenv
 
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 
 logging.basicConfig(level=logging.INFO)
 
@@ -26,12 +28,18 @@ STATUS_TOPIC_ID = int(os.getenv("STATUS_TOPIC_ID"))
 BD_HOST = str(os.getenv("BD_HOST"))
 LUCKYPAY_API_KEY = os.getenv("LUCKYPAY_API_KEY")
 LUCKYPAY_URL = os.getenv("LUCKYPAY_URL")
+SUPPORTS_BD = os.getenv("SUPPORTS_BD")
+CHAT_ID = os.getenv("CHAT_ID")
+STATS_TOPIC_ID = os.getenv("STATS_TOPIC_ID")
+TICKETS = os.getenv("TICKETS")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 router = Router()
 active_tickets = {}
 scheduled_jobs = {}
+supports = {}
+ticket_count = 0
 
 
 @dataclass
@@ -41,6 +49,8 @@ class TicketFromAPI:
     amount: str
     requisites: str
     provider_order_id: str
+    client_order_id: str
+    status: str
     message_id: int | None = None
 
 
@@ -50,10 +60,6 @@ def is_uuid(string: str) -> bool:
         return True
     except ValueError:
         return False
-
-
-def now_utc3() -> datetime:
-    return datetime.now(UTC) + timedelta(hours=3)
 
 
 async def get_ticket_from_db(ticket_number: str) -> TicketFromAPI | None:
@@ -74,6 +80,8 @@ async def get_ticket_from_db(ticket_number: str) -> TicketFromAPI | None:
                     data = data["order"]
 
                     provider_order_id = data["provider_order_id"]
+                    client_order_id = data["client_order_id"]
+                    status = data["status"]
                     provider_id = data["provider_id"]
                     client_id = data["client_id"]
 
@@ -95,11 +103,32 @@ async def get_ticket_from_db(ticket_number: str) -> TicketFromAPI | None:
                         client_name=client_name,
                         amount=str(data["amount"]),
                         requisites=data["holder_account"],
-                        provider_order_id=provider_order_id
+                        provider_order_id=provider_order_id,
+                        status=status,
+                        client_order_id=client_order_id
 
                     )
             except Exception as e:
                 logging.error(f" === APP_LOG: error getting ticket in luckypay db, ticket - {ticket} {e}")
+
+
+def save_ticket_count():
+    with open(TICKETS, "w") as file:
+        file.write(str(ticket_count))
+
+    logging.info(f" === APP_LOG: Saved ticket count: {ticket_count}")
+
+
+def read_ticket_count():
+    global ticket_count
+    try:
+        with open(TICKETS, "r") as file:
+            ticket_count = int(file.read().strip())
+        logging.info(f" === APP_LOG: Loaded Ticket count — successful: {ticket_count}")
+
+    except FileNotFoundError:
+        ticket_count = 0
+        logging.info(" === APP_LOG: No tickets file found. Starting fresh.")
 
 
 # Загрузка заявок из файла
@@ -155,18 +184,18 @@ def remove_reminder(ticket_number):
 
 
 def count_elapsed_time(ticket: dict) -> int:
-    start_time = datetime.strptime(ticket["start_time"], '%H:%M %d.%m.%Y').replace(tzinfo=UTC)
-    elapsed_time = datetime.now(UTC) + timedelta(hours=3) - start_time  # Разница во времени
+    start_time = datetime.strptime(ticket["start_time"], '%H:%M %d.%m.%Y')
+    elapsed_time = datetime.now() - start_time  # Разница во времени
     return int(elapsed_time.total_seconds() // 60)
 
 
 # Отправка напоминания
 async def send_reminder(ticket_number: str) -> None:
     try:
-        if (active_tickets[ticket_number]['remind_times'] * REMINDER_INTERVAL
-                - REMINDER_INTERVAL != REMINDER_INTERVAL and
+        if (active_tickets[ticket_number]['remind_times'] not in (2, 4) and
                 active_tickets[ticket_number]['remind_times'] % 2 == 0
         ):
+            logging.info(f"SKIPPED times {active_tickets[ticket_number]['remind_times']}")
             # проверка чтобы добавить 45 минут в 30 минутный интервал
             active_tickets[ticket_number]['remind_times'] += 1
             return
@@ -224,6 +253,83 @@ async def remove_notifications(
     active_tickets[ticket_number]["notification_messages"] = []
 
 
+def set_support_scheduler():
+    schedule.every().day.at("12:00").do(lambda: asyncio.create_task(send_support_notification("00:00-12:00")))
+    schedule.every().day.at("00:00").do(lambda: asyncio.create_task(send_support_notification("12:00-00:00")))
+    logging.info(" === APP_LOG: Set Support schedule")
+
+
+def load_supports():
+    global supports
+    try:
+        with open(SUPPORTS_BD, "r", encoding='utf-8') as file:
+            supports = json.load(file)
+        logging.info(f" === APP_LOG: Loaded supports — successful: {supports}")
+
+    except FileNotFoundError:
+        supports = {}
+        logging.info(" === APP_LOG: No supports file found. Starting fresh.")
+
+
+async def send_support_notification(time: str):
+    global supports
+    global ticket_count
+    now = datetime.now().date()
+    if time == "12:00-00:00":
+        now = now - timedelta(days=1)
+    text = time + ' -- ' + now.strftime('%d.%m.%Y') + f"\nЗаявок: {ticket_count}"
+    sla = 0
+    text2 = ""
+    for support in supports:
+        text2 += (f"{support}: {supports[support].get("+", 0)} / "
+                  f"{supports[support].get("-", 0) + supports[support].get("!", 0)}\n")
+        sla += supports[support].get("!", 0)
+    text = text + f"\nSLA: {sla}" + "\n\n" + text2
+    supports = {}
+    ticket_count = 0
+    save_ticket_count()
+    save_supports()
+    try:
+        await bot.send_message(chat_id=CHAT_ID, message_thread_id=STATS_TOPIC_ID, text=text)
+    except Exception as e:
+        logging.error(f" === APP_LOG: Failed to send support stats notification {e}")
+    logging.info(" === APP_LOG: Sent support stats")
+
+
+def save_supports():
+    try:
+        # Открываем файл в текстовом режиме записи
+        with open(SUPPORTS_BD, "w", encoding="utf-8") as file:
+            # Сериализуем данные в JSON и записываем
+            json.dump(supports, file, indent=4, ensure_ascii=False)
+        logging.info(" === APP_LOG: Supports saved successfully.")
+    except Exception as e:
+        logging.error(f" === APP_LOG: Error saving Supports: {e}")
+
+
+def save_support_action(command: str, support_name: str) -> None:
+    global supports
+    global ticket_count
+
+    if support_name not in supports:
+        supports[support_name] = {}
+    if supports[support_name].get(command) is None:
+        supports[support_name][command] = 0
+
+    supports[support_name][command] += 1
+    save_supports()
+    if command in ("!", "-"):
+        ticket_count += 1
+        save_ticket_count()
+
+
+def get_username(message: Message) -> str:
+    user = message.from_user.first_name
+    if message.from_user.last_name:
+        user = user + " " + message.from_user.last_name
+    return user
+
+
 async def close_ticket(
         ticket_number: str,
         chat_id: str,
@@ -254,17 +360,32 @@ async def close_ticket(
     ticket = active_tickets[ticket_number]
 
     if change_status:
-        text = (f"{ticket_number}\n📥 открыт в {date_time_formatter(ticket['start_time'])}\n✅ закрыт "
-                f"в {date_time_formatter(now_utc3().strftime('%H:%M %d.%m.%Y'))}")
+        user = get_username(message)
+
+        text = (f"{ticket_number}\n\n📥 открыт в {date_time_formatter(ticket['start_time'])}\n✅ закрыт"
+                f" в {date_time_formatter(datetime.now().strftime('%H:%M %d.%m.%Y'))}")
         if sla:
             text += f"\n🟥SLA {count_elapsed_time(ticket)} мин."
-
-        # Отправляем сообщение о закрытии в тему Статус
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=ticket['opens_message_id'],
-            text=text
+            save_support_action("!", user)
+        else:
+            save_support_action("-", user)
+        text += (
+            f"\n\nПровайдер: {ticket["api_ticket"]["provider_name"]}\nМерчант: {ticket["api_ticket"]["client_name"]}\n"
+            f"Сумма: {ticket["api_ticket"]["amount"]}\nРеквизиты: {ticket["api_ticket"]["requisites"]}\n\n"
+            f"{ticket["opened_by"]}\n"
+            f"{user}\n\n"
+            f"{ticket["api_ticket"]["provider_order_id"]}"
         )
+
+        # # Отправляем сообщение о закрытии в тему Статус
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=ticket['opens_message_id'],
+                text=text
+            )
+        except:
+            logging.error(f" === APP_LOG: Failed to edit message for ticket {ticket_number}")
 
     remove_reminder(ticket_number)  # Удаляем задачу из планировщика
     # Удаляем все сообщения-оповещения
@@ -280,7 +401,18 @@ async def close_ticket(
 
     try:
         # Удаляем сообщение с заявкой
-        await bot.delete_message(chat_id=chat_id, message_id=message.reply_to_message.message_id)
+        if message.reply_to_message.media_group_id:
+            # Delete all messages in the media group
+            for msg_id in range(message.reply_to_message.message_id,
+                                message.reply_to_message.message_id + 2):
+                try:
+                    logging.info(f"Media group id: {message.reply_to_message.media_group_id}")
+                    await bot.delete_message(chat_id=message.chat.id, message_id=msg_id)
+                except Exception as e:
+                    logging.error(f"Error deleting message {msg_id}: {e}")
+        else:
+            # Delete the single replied message
+            await bot.delete_message(chat_id=message.chat.id, message_id=message.reply_to_message.message_id)
         logging.info(
             f" === APP_LOG: Message {message.reply_to_message.message_id} for ticket {ticket_number} deleted.")
     except Exception as e:
@@ -303,10 +435,11 @@ def get_ticket_from_reply(message: Message) -> str:
 # --- Команды бота ---------------------------------------------------------
 @router.message()
 async def handle_message(message: Message):
+    global active_tickets
     # Проверяем, что сообщение пришло из группы или супергруппы
     if message.chat.type in ["group", "supergroup"]:
         logging.info(f" === APP_LOG: Message received from the group: {message.chat.title} | {message.text}")
-        now = now_utc3().strftime('%H:%M %d.%m.%Y')
+        now = datetime.now().strftime('%H:%M %d.%m.%Y')
         chat_id = message.chat.id
         topic_id = message.message_thread_id
 
@@ -338,15 +471,20 @@ async def handle_message(message: Message):
                         ticket.message_id = (await message.reply_to_message.reply(
                             f"Провайдер: {ticket.provider_name}\nМерчант: {ticket.client_name}\n"
                             f"Сумма: {ticket.amount}\nРеквизиты: {ticket.requisites}\n\n"
-                            f"{ticket.provider_order_id}"
+                            f"{ticket.status}\n\n"
+                            f"Провайдер: {ticket.provider_order_id}\n"
+                            f"Мерчант: {ticket.client_order_id}"
                         )).message_id
-                    except Exception:
-                        logging.error(f" === APP_LOG: Failed to send detail message for ticket {ticket_number}")
+                    except Exception as e:
+                        logging.error(f" === APP_LOG: Failed to send detail message for ticket {ticket_number} {e}")
 
                 # Отправляем сообщение в тему Статус
                 opens_message_id = await bot.send_message(
                     chat_id=chat_id,
-                    text=f"{ticket_number}\n📥 открыт в {date_time_formatter(now)}",
+                    text=f"{ticket_number}\n📥 открыт в {date_time_formatter(now)}\n\n"
+                         f"Провайдер: {ticket.provider_name}\nМерчант: {ticket.client_name}\n"
+                         f"Сумма: {ticket.amount}\nРеквизиты: {ticket.requisites}\n\n"
+                         f"{ticket.provider_order_id}",
                     message_thread_id=STATUS_TOPIC_ID
                 )
 
@@ -358,7 +496,9 @@ async def handle_message(message: Message):
                     "opens_message_id": opens_message_id.message_id,
                     "detail_message_id": ticket.message_id if ticket else None,
                     "remind_times": 0,
-                    "notification_messages": []
+                    "notification_messages": [],
+                    "opened_by": get_username(message),
+                    "api_ticket": asdict(ticket)
                 }
                 save_tickets()
                 schedule_reminder(ticket_number)
@@ -369,12 +509,24 @@ async def handle_message(message: Message):
                 logging.info(f" === APP_LOG: Message '{message.text}'for ticket {ticket_number} deleted.")
             except Exception as e:
                 logging.error(f"Failed to delete message '{message.text}' for ticket {ticket_number}: {e}")
+            save_support_action(message.text, get_username(message))
+
+        elif "delete old" in message.text:
+            new_dict = {}
+            for key, value in active_tickets.items():
+                if datetime.strptime(active_tickets[key]['start_time'], '%H:%M %d.%m.%Y') > datetime.now() - timedelta(
+                        minutes=int(message.text.split()[-1])):
+                    new_dict[key] = value
+
+            active_tickets = new_dict
+            save_tickets()
+            logging.info(f" === APP_LOG: Deleted old tickets, new: {active_tickets}")
 
         elif message.text == "-":
             ticket_number = get_ticket_from_reply(message)
 
             logging.info(
-                f" === APP_LOG: {now_utc3().strftime('%H:%M %d.%m.%Y')}: closing '{message.text}' method was used {ticket_number}")
+                f" === APP_LOG: {datetime.now().strftime('%H:%M %d.%m.%Y')}: closing '{message.text}' method was used {ticket_number}")
 
             await close_ticket(ticket_number, chat_id, message)
 
@@ -382,7 +534,7 @@ async def handle_message(message: Message):
             ticket_number = get_ticket_from_reply(message)
 
             logging.info(
-                f" === APP_LOG: {now_utc3().strftime('%H:%M %d.%m.%Y')}: closing '{message.text}' method was used {ticket_number}")
+                f" === APP_LOG: {datetime.now().strftime('%H:%M %d.%m.%Y')}: closing '{message.text}' method was used {ticket_number}")
 
             await close_ticket(ticket_number, chat_id, message, sla=True)
 
@@ -488,7 +640,7 @@ async def handle_message(message: Message):
 
         # Помощь по командам
         elif "bot help" == message.text.lower():
-            logging.info(f" === APP_LOG: {now_utc3().strftime('%H:%M %d.%m.%Y')}: Method \"bot help\" triggered")
+            logging.info(f" === APP_LOG: {datetime.now().strftime('%H:%M %d.%m.%Y')}: Method \"bot help\" triggered")
 
             help_text = (
                 "📋 **Доступные команды**:\n"
@@ -513,7 +665,10 @@ async def handle_message(message: Message):
 
 logging.info(f" === APP_LOG: Inited Router  — {dp.include_router(router)}")  # Регистрация маршрутизатора
 load_tickets()  # Загрузка заявок из БД
+load_supports()
 load_scheduler_jobs()  # Загрузка задач планировщика из БД
+set_support_scheduler()
+read_ticket_count()
 
 
 # Основной цикл для выполнения задач планировщика
@@ -531,6 +686,10 @@ async def main():
     await dp.start_polling(bot)
 
 
+logging.info(datetime.now())
+
 if __name__ == "__main__":
     atexit.register(save_tickets)
+    atexit.register(save_supports)
+    atexit.register(save_ticket_count)
     asyncio.run(main())

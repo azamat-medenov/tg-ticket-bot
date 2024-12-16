@@ -9,3 +9,5 @@ services:
     volumes:
       - .:/app
     command: ["python", "./app/main.py"]
+    environment:
+      - TZ=Europe/Moscow
